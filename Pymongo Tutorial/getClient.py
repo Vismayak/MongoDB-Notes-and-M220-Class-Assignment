@@ -4,15 +4,16 @@ from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure
 
 
-def connect():
+def getClient():
     # Function to connect to MongoDB
     try:
-        md_connection = MongoClient(host='localhost', port=27017)
+        client = MongoClient(host='localhost', port=27017)
         print("Connected Succesfully")
+        return client
     except ConnectionFailure as error:
         sys.stderr.write("Could not connect to MongoDB: %s" % error)
         sys.exit(1)
 
 
 if __name__ == '__main__':
-    connect()
+    getClient()
