@@ -44,11 +44,13 @@ def get_db():
         """
 
         db = g._database = MongoClient(
-        MFLIX_DB_URI,
-        # TODO: Connection Pooling
-        # Set the maximum connection pool size to 50 active connections.
-        # TODO: Timeouts
-        # Set the write timeout limit to 2500 milliseconds.
+            MFLIX_DB_URI,
+            maxPoolSize=50,
+            # TODO: Connection Pooling
+            # Set the maximum connection pool size to 50 active connections.
+            # TODO: Timeouts
+            # Set the write timeout limit to 2500 milliseconds.
+            wtimeoutMS=2500
         )[MFLIX_DB_NAME]
     return db
 
@@ -78,7 +80,12 @@ def get_movies_by_country(countries):
         # Find movies matching the "countries" list, but only return the title
         # and _id. Do not include a limit in your own implementation, it is
         # included here to avoid sending 46000 documents down the wire.
-        return list(db.movies.find().limit(1))
+
+        movies = db.movies
+        ret = list(movies.find(
+            {"countries": {"$in": countries}}, {"title": 1}))
+        print(len(ret))
+        return ret
 
     except Exception as e:
         return e
@@ -154,6 +161,10 @@ def get_movies_faceted(filters, page, movies_per_page):
     # Add the necessary stages to the pipeline variable in the correct order.
     # pipeline.extend(...)
 
+    pipeline.append(skip_stage)
+    pipeline.append(limit_stage)
+    pipeline.append(facet_stage)
+
     try:
         movies = list(db.movies.aggregate(pipeline, allowDiskUse=True))[0]
         count = list(db.movies.aggregate(counting, allowDiskUse=True))[
@@ -195,7 +206,7 @@ def build_query_sort_project(filters):
 
             # TODO: Text and Subfield Search
             # Construct a query that will search for the chosen genre.
-            query = {}
+            query = {"genres": {"$in": filters["genres"]}}
 
     return query, sort, project
 
@@ -219,9 +230,12 @@ def get_movies(filters, page, movies_per_page):
     else:
         cursor = db.movies.find(query).sort(sort)
 
+    movies = cursor.limit(movies_per_page)
+
     total_num_movies = 0
     if page == 0:
         total_num_movies = db.movies.count_documents(query)
+        return (list(movies), total_num_movies)
     """
     Ticket: Paging
 
@@ -235,9 +249,15 @@ def get_movies(filters, page, movies_per_page):
 
     # TODO: Paging
     # Use the cursor to only return the movies that belong on the current page.
-    movies = cursor.limit(movies_per_page)
 
-    return (list(movies), total_num_movies)
+    if project:
+        cursor = db.movies.find(query, project).sort(
+            sort).skip(page * movies_per_page)
+    else:
+        cursor = db.movies.find(query).sort(sort).skip(page * movies_per_page)
+
+    movies = cursor.limit(movies_per_page)
+    return (list(movies), movies.count())
 
 
 def get_movie(id):
@@ -262,10 +282,25 @@ def get_movie(id):
         # Implement the required pipeline.
         pipeline = [
             {
-                "$match": {
-                    "_id": ObjectId(id)
+                '$lookup': {
+                    'from': 'comments',
+
+                    'pipeline': [
+                        {
+                            '$match': {
+                                '$expr': {
+                                    '$eq': [
+                                        '$movie_id', ObjectId(id)
+                                    ]
+                                }
+                            }
+                        },
+                        {"$sort": {"date": -1}}
+                    ],
+                    'as': 'comments'
                 }
-            }
+            },
+
         ]
 
         movie = db.movies.aggregate(pipeline).next()
@@ -283,6 +318,8 @@ def get_movie(id):
         `get_movie` returning None.
         """
 
+        return None
+    except InvalidId as _:
         return None
 
     except Exception as e:
@@ -326,7 +363,8 @@ def add_comment(movie_id, user, comment, date):
     """
     # TODO: Create/Update Comments
     # Construct the comment document to be inserted into MongoDB.
-    comment_doc = { "some_field": "some_value" }
+    comment_doc = {"name": user.name, "email": user.email,
+                   "movie_id": ObjectId(movie_id), "text": comment, "date": date}
     return db.comments.insert_one(comment_doc)
 
 
@@ -340,8 +378,8 @@ def update_comment(comment_id, user_email, text, date):
     # Use the user_email and comment_id to select the proper comment, then
     # update the "text" and "date" of the selected comment.
     response = db.comments.update_one(
-        { "some_field": "some_value" },
-        { "$set": { "some_other_field": "some_other_value" } }
+        {"_id": ObjectId(comment_id), "email": user_email},
+        {"$set": {"text": text, "date": date}}
     )
 
     return response
@@ -362,7 +400,8 @@ def delete_comment(comment_id, user_email):
 
     # TODO: Delete Comments
     # Use the user_email and comment_id to delete the proper comment.
-    response = db.comments.delete_one( { "_id": ObjectId(comment_id) } )
+    response = db.comments.delete_one(
+        {"_id": ObjectId(comment_id), "email": user_email})
     return response
 
 
@@ -389,7 +428,7 @@ def get_user(email):
     """
     # TODO: User Management
     # Retrieve the user document corresponding with the user's email.
-    return db.users.find_one({ "some_field": "some_value" })
+    return db.users.find_one({"email": email})
 
 
 def add_user(name, email, hashedpw):
@@ -410,10 +449,10 @@ def add_user(name, email, hashedpw):
         # Insert a user with the "name", "email", and "password" fields.
         # TODO: Durable Writes
         # Use a more durable Write Concern for this operation.
-        db.users.insert_one({
-            "name": "mongo",
-            "email": "mongo@mongodb.com",
-            "password": "flibbertypazzle"
+        db.users.with_options(write_concern=WriteConcern(w=2)).insert_one({
+            "name": name,
+            "email": email,
+            "password": hashedpw
         })
         return {"success": True}
     except DuplicateKeyError:
@@ -432,8 +471,9 @@ def login_user(email, jwt):
         # Use an UPSERT statement to update the "jwt" field in the document,
         # matching the "user_id" field with the email passed to this function.
         db.sessions.update_one(
-            { "some_field": "some_value" },
-            { "$set": { "some_other_field": "some_other_value" } }
+            {"user_id": email},
+            {"$set": {"jwt": jwt}},
+            upsert=True
         )
         return {"success": True}
     except Exception as e:
@@ -450,7 +490,7 @@ def logout_user(email):
     try:
         # TODO: User Management
         # Delete the document in the `sessions` collection matching the email.
-        db.sessions.delete_one({ "some_field": "some_value" })
+        db.sessions.delete_one({"user_id": email})
         return {"success": True}
     except Exception as e:
         return {"error": e}
@@ -465,7 +505,7 @@ def get_user_session(email):
     try:
         # TODO: User Management
         # Retrieve the session document corresponding with the user's email.
-        return db.sessions.find_one({ "some_field": "some_value" })
+        return db.sessions.find_one({"user_id": email})
     except Exception as e:
         return {"error": e}
 
@@ -478,8 +518,8 @@ def delete_user(email):
     try:
         # TODO: User Management
         # Delete the corresponding documents from `users` and `sessions`.
-        db.sessions.delete_one({ "some_field": "some_value" })
-        db.users.delete_one({ "some_field": "some_value" })
+        db.sessions.delete_one({"user_id": email})
+        db.users.delete_one({"email": email})
         if get_user(email) is None:
             return {"success": True}
         else:
@@ -506,8 +546,8 @@ def update_prefs(email, prefs):
         # TODO: User preferences
         # Use the data in "prefs" to update the user's preferences.
         response = db.users.update_one(
-            { "some_field": "some_value" },
-            { "$set": { "some_other_field": "some_other_value" } }
+            {"email": email},
+            {"$set": {"preferences": prefs}}
         )
         if response.matched_count == 0:
             return {'error': 'no user found'}
@@ -533,9 +573,14 @@ def most_active_commenters():
     """
     # TODO: User Report
     # Return the 20 users who have commented the most on MFlix.
-    pipeline = []
+    pipeline = [
+        {"$sortByCount": "$email"},
+        {"$limit": 20},
+        {"$project": {"count": 1}}
 
-    rc = db.comments.read_concern # you may want to change this read concern!
+    ]
+
+    rc = db.comments.read_concern  # you may want to change this read concern!
     comments = db.comments.with_options(read_concern=rc)
     result = comments.aggregate(pipeline)
     return list(result)
